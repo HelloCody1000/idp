@@ -1,0 +1,8 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "idp-mvp" },
+  { "ParameterKey": "ServiceName", "ParameterValue": "java-app" },
+  { "ParameterKey": "ImageUri", "ParameterValue": "REPLACE_WITH_ECR_IMAGE_URI" },
+  { "ParameterKey": "ContainerPort", "ParameterValue": "3000" },
+  { "ParameterKey": "ListenerPathPattern", "ParameterValue": "/java-app*" },
+  { "ParameterKey": "ListenerPriority", "ParameterValue": "20" }
+]

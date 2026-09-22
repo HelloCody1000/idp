@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDP MVP - reusable service stack. Deploys one containerized app (task
+  definition, target group, ALB listener rule, ECS service) onto the
+  shared environment created by idp-environment-stack.yaml. One of these
+  stacks per app/service - pass a different ServiceName, ImageUri, and
+  ListenerPriority for each.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: idp-mvp
+    Description: ProjectName value used when the idp-environment-stack was created (used to import its exports).
+
+  ServiceName:
+    Type: String
+    Description: Name of this service, e.g. js-app or java-app.
+
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI including tag, e.g. <account>.dkr.ecr.<region>.amazonaws.com/js-app:latest.
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+    Description: Port the app container listens on. Must match the environment stack's ContainerPort.
+
+  Cpu:
+    Type: String
+    Default: '256'
+
+  Memory:
+    Type: String
+    Default: '512'
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+  HealthCheckPath:
+    Type: String
+    Default: /
+
+  ListenerPathPattern:
+    Type: String
+    Description: ALB listener rule path pattern for this service, e.g. /js-app*.
+
+  ListenerPriority:
+    Type: Number
+    Description: ALB listener rule priority. Must be unique across all services sharing the listener.
+
+Resources:
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-${ServiceName}
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${EnvironmentName}-task-execution-role-arn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${EnvironmentName}-task-role-arn
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref ImageUri
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: ${EnvironmentName}-log-group
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref ServiceName
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-${ServiceName}-tg
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-vpc-id
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !ImportValue
+        Fn::Sub: ${EnvironmentName}-alb-listener-arn
+      Priority: !Ref ListenerPriority
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Ref ListenerPathPattern
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerRule
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !ImportValue
+        Fn::Sub: ${EnvironmentName}-cluster-name
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: ${EnvironmentName}-public-subnet-1
+            - !ImportValue
+              Fn::Sub: ${EnvironmentName}-public-subnet-2
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: ${EnvironmentName}-ecs-tasks-sg-id
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  ServiceName:
+    Value: !Ref Service
+
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+
+  AlbDnsName:
+    Description: Shared ALB DNS name. Combine with ListenerPathPattern (minus the trailing *) to reach this service.
+    Value: !ImportValue
+      Fn::Sub: ${EnvironmentName}-alb-dns
+
+  ListenerPathPattern:
+    Value: !Ref ListenerPathPattern
