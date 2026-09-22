@@ -26,7 +26,7 @@ phases:
     commands:
       - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
       - >
-        printf '[{"ParameterKey":"EnvironmentName","ParameterValue":"%s"},{"ParameterKey":"ServiceName","ParameterValue":"%s"},{"ParameterKey":"ImageUri","ParameterValue":"%s.dkr.ecr.%s.amazonaws.com/%s:%s"},{"ParameterKey":"ContainerPort","ParameterValue":"%s"},{"ParameterKey":"ListenerPathPattern","ParameterValue":"%s"},{"ParameterKey":"ListenerPriority","ParameterValue":"%s"}]'
+        printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s"}}'
         "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" > deploy-params.json
 
 artifacts:
