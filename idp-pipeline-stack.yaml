@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDP MVP - reusable per-app CI/CD pipeline. Source (GitHub via the
+  idp-github-connection CodeStar connection) -> Build (CodeBuild: language
+  build, docker build/tag/push to ECR) -> Deploy (CloudFormation
+  create/update of idp-service-stack.yaml with the freshly pushed image).
+  One of these stacks per app - pass a different AppName/BuildSpecPath/
+  TriggerPath for each. Only triggers when files under TriggerPath change
+  on the watched branch.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: idp-mvp
+    Description: ProjectName used for the idp-environment-stack (used to import its exports).
+
+  AppName:
+    Type: String
+    Description: App/service name, e.g. js-app or java-app. Must match the ECR repo name and idp-service-stack ServiceName.
+
+  BuildSpecPath:
+    Type: String
+    Description: Path to this app's buildspec.yml, e.g. apps/js-app/buildspec.yml.
+
+  TriggerPath:
+    Type: String
+    Description: Glob path that must change to trigger this pipeline, e.g. apps/js-app/**.
+
+  CodeBuildImage:
+    Type: String
+    Default: aws/codebuild/standard:7.0
+    Description: CodeBuild managed image (includes Docker, Node, Maven/Java, npm pre-installed).
+
+  RepositoryId:
+    Type: String
+    Default: HelloCody1000/idp
+    Description: GitHub "owner/repo" this pipeline watches.
+
+  BranchName:
+    Type: String
+    Default: develop
+    Description: Branch to build from.
+
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the AWS CodeStar Connection (output of idp-github-connection stack). Must already be Available.
+
+Resources:
+
+  # ---------- Artifact storage ----------
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-${AppName}-pipeline-artifacts-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------- IAM: CodeBuild ----------
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AppName}
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+  # ---------- IAM: CodePipeline ----------
+
+  PipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-pipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${EnvironmentName}-${AppName}/*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationDeployRole.Arn
+
+  # ---------- IAM: CloudFormation deploy action ----------
+  # Assumed by the CloudFormation service (not CodePipeline directly) to create/update
+  # the idp-service-stack resources: task definition, target group, listener rule, ECS service.
+
+  CloudFormationDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-cfn-deploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy-service-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                  - ecs:TagResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                  - elasticloadbalancing:ModifyRule
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${EnvironmentName}-task-execution-role-arn
+                  - !ImportValue
+                    Fn::Sub: ${EnvironmentName}-task-role-arn
+
+  # ---------- CodeBuild ----------
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${EnvironmentName}-${AppName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref CodeBuildImage
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Ref BuildSpecPath
+
+  # ---------- Pipeline ----------
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${EnvironmentName}-${AppName}-pipeline
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: Source
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref BranchName
+                FilePaths:
+                  Includes:
+                    - !Ref TriggerPath
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Ref RepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAndPush
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployServiceStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub ${EnvironmentName}-${AppName}
+                TemplatePath: BuildOutput::idp-service-stack.yaml
+                TemplateConfiguration: BuildOutput::deploy-params.json
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject

@@ -1,0 +1,35 @@
+version: 0.2
+
+env:
+  variables:
+    SERVICE_NAME: js-app
+    ENVIRONMENT_NAME: idp-mvp
+    CONTAINER_PORT: "3000"
+    LISTENER_PATH_PATTERN: /js-app*
+    LISTENER_PRIORITY: "10"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+  pre_build:
+    commands:
+      - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - npm install --prefix apps/js-app
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+  build:
+    commands:
+      - docker build -t $SERVICE_NAME:$IMAGE_TAG apps/js-app
+      - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+  post_build:
+    commands:
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+      - >
+        printf '[{"ParameterKey":"EnvironmentName","ParameterValue":"%s"},{"ParameterKey":"ServiceName","ParameterValue":"%s"},{"ParameterKey":"ImageUri","ParameterValue":"%s.dkr.ecr.%s.amazonaws.com/%s:%s"},{"ParameterKey":"ContainerPort","ParameterValue":"%s"},{"ParameterKey":"ListenerPathPattern","ParameterValue":"%s"},{"ParameterKey":"ListenerPriority","ParameterValue":"%s"}]'
+        "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" > deploy-params.json
+
+artifacts:
+  files:
+    - deploy-params.json
+    - idp-service-stack.yaml

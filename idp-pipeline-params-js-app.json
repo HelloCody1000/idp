@@ -1,0 +1,9 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "idp-mvp" },
+  { "ParameterKey": "AppName", "ParameterValue": "js-app" },
+  { "ParameterKey": "BuildSpecPath", "ParameterValue": "apps/js-app/buildspec.yml" },
+  { "ParameterKey": "TriggerPath", "ParameterValue": "apps/js-app/**" },
+  { "ParameterKey": "RepositoryId", "ParameterValue": "HelloCody1000/idp" },
+  { "ParameterKey": "BranchName", "ParameterValue": "develop" },
+  { "ParameterKey": "CodeStarConnectionArn", "ParameterValue": "REPLACE_WITH_CONNECTION_ARN" }
+]
