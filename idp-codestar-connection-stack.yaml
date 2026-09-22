@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDP MVP - GitHub CodeStar Connection. Creates the AWS CodeStarConnections
+  connection that lets CodeBuild/CodePipeline authenticate to pull from
+  the HelloCody1000/idp GitHub repo. The connection is created in PENDING
+  status - a one-time manual authorization in the AWS Console is required
+  before it can be used (see README-idp-codestar-connection.md).
+
+Parameters:
+  ConnectionName:
+    Type: String
+    Default: idp-github-connection
+    Description: Name shown for this connection in the AWS Console.
+
+Resources:
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Ref ConnectionName
+      ProviderType: GitHub
+
+Outputs:
+  ConnectionArn:
+    Description: Pass this ARN as the source connection in a CodeBuild/CodePipeline GitHub source stage.
+    Value: !Ref GitHubConnection
+    Export:
+      Name: !Sub ${AWS::StackName}-connection-arn
+
+  ConnectionStatus:
+    Description: Will be PENDING until you complete the manual authorization step in the console.
+    Value: !GetAtt GitHubConnection.ConnectionStatus
