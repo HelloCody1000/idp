@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDP self-service app pipeline. Launch this (directly, or as a Service
+  Catalog product) to onboard a new app: pick a language, point it at
+  your own git repo, and it creates an ECR repo plus a full CI/CD
+  pipeline (GitHub source -> CodeBuild language build + docker
+  build/tag/push -> CloudFormation deploy of idp-service-stack.yaml
+  onto the shared idp-environment-stack.yaml infrastructure). Requires
+  idp-environment-stack.yaml and an authorized CodeStar GitHub
+  connection to already exist.
+
+  Your app repo only needs a Dockerfile at its root plus, for Node,
+  package.json at the root, or for Java, a pom.xml that builds
+  target/app.jar (set <finalName>app</finalName> in your pom.xml).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: App basics
+        Parameters:
+          - AppName
+          - Language
+          - ContainerPort
+      - Label:
+          default: Your git repository
+        Parameters:
+          - RepositoryId
+          - BranchName
+      - Label:
+          default: Scaling
+        Parameters:
+          - MinCapacity
+          - MaxCapacity
+      - Label:
+          default: Routing (must not collide with another app's)
+        Parameters:
+          - ListenerPathPattern
+          - ListenerPriority
+      - Label:
+          default: Platform (defaults are almost always correct)
+        Parameters:
+          - EnvironmentName
+          - PlatformRepositoryId
+          - PlatformBranchName
+          - CodeStarConnectionArn
+    ParameterLabels:
+      AppName:
+        default: App name
+      Language:
+        default: Language
+      ContainerPort:
+        default: Container port
+      RepositoryId:
+        default: Git repo (owner/repo)
+      BranchName:
+        default: Branch to build from
+      MinCapacity:
+        default: Minimum tasks
+      MaxCapacity:
+        default: Maximum tasks
+      ListenerPathPattern:
+        default: URL path pattern
+      ListenerPriority:
+        default: Listener rule priority
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: '[a-z][a-z0-9-]{1,30}'
+    Description: Lowercase name for this app, e.g. my-checkout-service. Used as the ECR repo name and ECS service name.
+
+  Language:
+    Type: String
+    AllowedValues:
+      - nodejs
+      - java
+    Description: Runtime CodeBuild will use to build your app.
+
+  RepositoryId:
+    Type: String
+    Description: Your app's GitHub repo as "owner/repo", e.g. someuser/my-checkout-service.
+
+  BranchName:
+    Type: String
+    Default: develop
+    Description: Branch in your repo to build from.
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+    Description: Port your app listens on inside the container.
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum running tasks.
+
+  MaxCapacity:
+    Type: Number
+    Default: 2
+    Description: Maximum running tasks.
+
+  ListenerPathPattern:
+    Type: String
+    Description: ALB path pattern for this app, e.g. /my-checkout-service*.
+
+  ListenerPriority:
+    Type: Number
+    Description: ALB listener rule priority. Must be unique across every app sharing the environment's ALB.
+
+  EnvironmentName:
+    Type: String
+    Default: idp-mvp
+    Description: ProjectName used for the idp-environment-stack (used to import its exports).
+
+  PlatformRepositoryId:
+    Type: String
+    Default: HelloCody1000/idp
+    Description: Repo holding the platform's idp-service-stack.yaml template. Leave as default unless you forked the platform repo.
+
+  PlatformBranchName:
+    Type: String
+    Default: develop
+    Description: Branch of the platform repo to pull idp-service-stack.yaml from.
+
+  CodeStarConnectionArn:
+    Type: String
+    Description: ARN of the authorized AWS CodeStar Connection used to reach GitHub (shared across all apps).
+
+  CodeBuildImage:
+    Type: String
+    Default: aws/codebuild/standard:7.0
+    Description: CodeBuild managed image (includes Docker, Node, Maven/Java pre-installed).
+
+Conditions:
+  IsNodeJs: !Equals [!Ref Language, nodejs]
+
+Resources:
+
+  # ---------- Per-app ECR repo ----------
+
+  AppEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # ---------- Artifact storage ----------
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-${AppName}-pipeline-artifacts-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------- IAM: CodeBuild ----------
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt AppEcrRepo.Arn
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+  # ---------- IAM: CodePipeline ----------
+
+  PipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-pipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-execution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref CodeStarConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DescribeChangeSet
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${EnvironmentName}-${AppName}/*
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt CloudFormationDeployRole.Arn
+
+  # ---------- IAM: CloudFormation deploy action ----------
+
+  CloudFormationDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-${AppName}-cfn-deploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy-service-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                  - ecs:TagResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DescribeScalingPolicies
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: ecs.application-autoscaling.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:CreateRule
+                  - elasticloadbalancing:DeleteRule
+                  - elasticloadbalancing:ModifyRule
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: ${EnvironmentName}-task-execution-role-arn
+                  - !ImportValue
+                    Fn::Sub: ${EnvironmentName}-task-role-arn
+
+  # ---------- CodeBuild ----------
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${EnvironmentName}-${AppName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref CodeBuildImage
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: SERVICE_NAME
+            Value: !Ref AppName
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: CONTAINER_PORT
+            Value: !Ref ContainerPort
+          - Name: LISTENER_PATH_PATTERN
+            Value: !Ref ListenerPathPattern
+          - Name: LISTENER_PRIORITY
+            Value: !Ref ListenerPriority
+          - Name: MIN_CAPACITY
+            Value: !Ref MinCapacity
+          - Name: MAX_CAPACITY
+            Value: !Ref MaxCapacity
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !If
+          - IsNodeJs
+          - |
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  nodejs: 20
+              pre_build:
+                commands:
+                  - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                  - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                  - npm install
+                  - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+              build:
+                commands:
+                  - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                  - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+              post_build:
+                commands:
+                  - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                  - cp $CODEBUILD_SRC_DIR_PlatformSourceOutput/idp-service-stack.yaml .
+                  - >
+                    printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s","MinCapacity":"%s","MaxCapacity":"%s"}}'
+                    "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" "$MIN_CAPACITY" "$MAX_CAPACITY" > deploy-params.json
+            artifacts:
+              files:
+                - deploy-params.json
+                - idp-service-stack.yaml
+          - |
+            version: 0.2
+            phases:
+              install:
+                runtime-versions:
+                  java: corretto21
+              pre_build:
+                commands:
+                  - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                  - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                  - mvn -B package
+                  - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+              build:
+                commands:
+                  - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                  - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+              post_build:
+                commands:
+                  - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                  - cp $CODEBUILD_SRC_DIR_PlatformSourceOutput/idp-service-stack.yaml .
+                  - >
+                    printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s","MinCapacity":"%s","MaxCapacity":"%s"}}'
+                    "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" "$MIN_CAPACITY" "$MAX_CAPACITY" > deploy-params.json
+            artifacts:
+              files:
+                - deploy-params.json
+                - idp-service-stack.yaml
+
+  # ---------- Pipeline ----------
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${EnvironmentName}-${AppName}-pipeline
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            SourceActionName: AppSource
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref BranchName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: AppSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Ref RepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: AppSourceOutput
+            - Name: PlatformSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionArn
+                FullRepositoryId: !Ref PlatformRepositoryId
+                BranchName: !Ref PlatformBranchName
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: PlatformSourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAndPush
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                PrimarySource: AppSourceOutput
+              InputArtifacts:
+                - Name: AppSourceOutput
+                - Name: PlatformSourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployServiceStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub ${EnvironmentName}-${AppName}
+                TemplatePath: BuildOutput::idp-service-stack.yaml
+                TemplateConfiguration: BuildOutput::deploy-params.json
+                RoleArn: !GetAtt CloudFormationDeployRole.Arn
+              InputArtifacts:
+                - Name: BuildOutput
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+
+  CodeBuildProjectName:
+    Value: !Ref CodeBuildProject
+
+  EcrRepositoryUri:
+    Value: !GetAtt AppEcrRepo.RepositoryUri

@@ -33,9 +33,15 @@ Parameters:
     Type: String
     Default: '512'
 
-  DesiredCount:
+  MinCapacity:
     Type: Number
     Default: 1
+    Description: Minimum number of running tasks. Application Auto Scaling will not scale below this.
+
+  MaxCapacity:
+    Type: Number
+    Default: 2
+    Description: Maximum number of running tasks. Application Auto Scaling will not scale above this.
 
   HealthCheckPath:
     Type: String
@@ -111,7 +117,7 @@ Resources:
       Cluster: !ImportValue
         Fn::Sub: ${EnvironmentName}-cluster-name
       TaskDefinition: !Ref TaskDefinition
-      DesiredCount: !Ref DesiredCount
+      DesiredCount: !Ref MinCapacity
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -128,6 +134,32 @@ Resources:
         - ContainerName: !Ref ServiceName
           ContainerPort: !Ref ContainerPort
           TargetGroupArn: !Ref TargetGroup
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: Service
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - service/${ClusterName}/${ServiceName}
+        - ClusterName: !ImportValue
+            Fn::Sub: ${EnvironmentName}-cluster-name
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-${ServiceName}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
 
 Outputs:
   ServiceName:
