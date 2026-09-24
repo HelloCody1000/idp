@@ -79,7 +79,9 @@ Parameters:
 
   RepositoryId:
     Type: String
-    Description: Your app's GitHub repo as "owner/repo", e.g. someuser/my-checkout-service.
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+    ConstraintDescription: 'Must be "owner/repo" only, e.g. someuser/my-checkout-service - not a full URL.'
+    Description: Your app's GitHub repo as "owner/repo" (no https:// or github.com), e.g. someuser/my-checkout-service.
 
   BranchName:
     Type: String
@@ -131,7 +133,9 @@ Parameters:
   CodeBuildImage:
     Type: String
     Default: aws/codebuild/standard:7.0
-    Description: CodeBuild managed image (includes Docker, Node, Maven/Java pre-installed).
+    AllowedPattern: '[A-Za-z0-9][A-Za-z0-9._/:#@-]*'
+    ConstraintDescription: Leave as the default unless you know you need a different CodeBuild managed image.
+    Description: CodeBuild managed image name (Docker/Node/Maven/Java preinstalled) - leave as default.
 
 Conditions:
   IsNodeJs: !Equals [!Ref Language, nodejs]
