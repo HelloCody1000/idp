@@ -130,18 +130,26 @@ Resources:
                   for i in $(seq 1 20); do
                     STATUS=$(aws servicecatalog describe-provisioned-product --id "$PROVISIONED_PRODUCT_ID" --query 'ProvisionedProductDetail.Status' --output text 2>/dev/null || echo "GONE")
                     echo "[$i] provisioned product status: $STATUS"
-                    if [ "$STATUS" == "GONE" ]; then
+                    if [ "$STATUS" = "GONE" ]; then
                       echo "Provisioned product fully removed."
                       break
                     fi
-                    if [ "$STATUS" == "ERROR" ] && [ "$FORCED_ECR_DELETE" == "false" ]; then
-                      echo "Termination stuck, likely ECR repo $APP_NAME still has images - force-deleting it."
-                      aws ecr delete-repository --repository-name "$APP_NAME" --force || true
-                      FORCED_ECR_DELETE=true
+                    if [ "$STATUS" = "ERROR" ] || [ "$STATUS" = "TAINTED" ]; then
+                      if [ "$FORCED_ECR_DELETE" = "false" ]; then
+                        echo "Termination stuck ($STATUS), likely ECR repo $APP_NAME still has images - force-deleting it."
+                        aws ecr delete-repository --repository-name "$APP_NAME" --force || true
+                        FORCED_ECR_DELETE=true
+                      fi
                       aws servicecatalog terminate-provisioned-product --provisioned-product-id "$PROVISIONED_PRODUCT_ID" || true
                     fi
                     sleep 15
                   done
+
+                  FINAL_STATUS=$(aws servicecatalog describe-provisioned-product --id "$PROVISIONED_PRODUCT_ID" --query 'ProvisionedProductDetail.Status' --output text 2>/dev/null || echo "GONE")
+                  if [ "$FINAL_STATUS" != "GONE" ]; then
+                    echo "ERROR: provisioned product still not terminated after retries (status: $FINAL_STATUS). Manual cleanup needed."
+                    exit 1
+                  fi
 
                   echo "=== Teardown complete for $APP_NAME ==="
       Environment:
