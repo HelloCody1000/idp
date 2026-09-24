@@ -9,9 +9,11 @@ Description: >
   idp-environment-stack.yaml and an authorized CodeStar GitHub
   connection to already exist.
 
-  Your app repo only needs a Dockerfile at its root plus, for Node,
-  package.json at the root, or for Java, a pom.xml that builds
-  target/app.jar (set <finalName>app</finalName> in your pom.xml).
+  Your app repo needs a Dockerfile at its root, plus: for Node,
+  package.json at the root; for Java, a pom.xml that builds
+  target/app.jar (set <finalName>app</finalName> in your pom.xml); for
+  Docker, nothing else - your Dockerfile must build the app itself
+  (e.g. a multi-stage build).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -75,7 +77,12 @@ Parameters:
     AllowedValues:
       - nodejs
       - java
-    Description: Runtime CodeBuild will use to build your app.
+      - docker
+    Description: >-
+      nodejs = CodeBuild runs "npm install" then docker build. java = CodeBuild
+      runs "mvn package" (OpenJDK 21) then docker build, expects target/app.jar.
+      docker = no language build step - your Dockerfile handles everything
+      itself (multi-stage or otherwise), CodeBuild just builds/tags/pushes it.
 
   RepositoryId:
     Type: String
@@ -139,6 +146,7 @@ Parameters:
 
 Conditions:
   IsNodeJs: !Equals [!Ref Language, nodejs]
+  IsJava: !Equals [!Ref Language, java]
 
 Resources:
 
@@ -392,33 +400,58 @@ Resources:
               files:
                 - deploy-params.json
                 - idp-service-stack.yaml
-          - |
-            version: 0.2
-            phases:
-              install:
-                runtime-versions:
-                  java: corretto21
-              pre_build:
-                commands:
-                  - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-                  - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-                  - mvn -B package
-                  - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
-              build:
-                commands:
-                  - docker build -t $SERVICE_NAME:$IMAGE_TAG .
-                  - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
-              post_build:
-                commands:
-                  - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
-                  - cp $CODEBUILD_SRC_DIR_PlatformSourceOutput/idp-service-stack.yaml .
-                  - >
-                    printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s","MinCapacity":"%s","MaxCapacity":"%s"}}'
-                    "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" "$MIN_CAPACITY" "$MAX_CAPACITY" > deploy-params.json
-            artifacts:
-              files:
-                - deploy-params.json
-                - idp-service-stack.yaml
+          - !If
+            - IsJava
+            - |
+              version: 0.2
+              phases:
+                install:
+                  runtime-versions:
+                    java: corretto21
+                pre_build:
+                  commands:
+                    - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                    - mvn -B package
+                    - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+                build:
+                  commands:
+                    - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                    - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                post_build:
+                  commands:
+                    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                    - cp $CODEBUILD_SRC_DIR_PlatformSourceOutput/idp-service-stack.yaml .
+                    - >
+                      printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s","MinCapacity":"%s","MaxCapacity":"%s"}}'
+                      "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" "$MIN_CAPACITY" "$MAX_CAPACITY" > deploy-params.json
+              artifacts:
+                files:
+                  - deploy-params.json
+                  - idp-service-stack.yaml
+            - |
+              version: 0.2
+              phases:
+                pre_build:
+                  commands:
+                    - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                    - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
+                build:
+                  commands:
+                    - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                    - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                post_build:
+                  commands:
+                    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
+                    - cp $CODEBUILD_SRC_DIR_PlatformSourceOutput/idp-service-stack.yaml .
+                    - >
+                      printf '{"Parameters":{"EnvironmentName":"%s","ServiceName":"%s","ImageUri":"%s.dkr.ecr.%s.amazonaws.com/%s:%s","ContainerPort":"%s","ListenerPathPattern":"%s","ListenerPriority":"%s","MinCapacity":"%s","MaxCapacity":"%s"}}'
+                      "$ENVIRONMENT_NAME" "$SERVICE_NAME" "$AWS_ACCOUNT_ID" "$AWS_DEFAULT_REGION" "$SERVICE_NAME" "$IMAGE_TAG" "$CONTAINER_PORT" "$LISTENER_PATH_PATTERN" "$LISTENER_PRIORITY" "$MIN_CAPACITY" "$MAX_CAPACITY" > deploy-params.json
+              artifacts:
+                files:
+                  - deploy-params.json
+                  - idp-service-stack.yaml
 
   # ---------- Pipeline ----------
 
