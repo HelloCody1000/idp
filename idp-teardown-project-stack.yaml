@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IDP MVP - on-demand per-app teardown. Creates a single CodeBuild
+  project (no pipeline/source - this is an admin action, not a
+  deploy) that deletes one app's service stack, empties and terminates
+  its Service Catalog-provisioned pipeline, and force-deletes its ECR
+  repo if images are blocking deletion. Does NOT touch
+  idp-environment-stack.yaml - that's shared infrastructure other apps
+  may still depend on and is torn down separately, on purpose.
+
+  Trigger a teardown with:
+    aws codebuild start-build --project-name idp-mvp-app-teardown \
+      --environment-variables-override \
+        name=APP_NAME,value=<app-name>,type=PLAINTEXT \
+        name=PROVISIONED_PRODUCT_ID,value=<pp-xxxxxxxx>,type=PLAINTEXT
+
+  Find the provisioned product ID with:
+    aws servicecatalog scan-provisioned-products --query "ProvisionedProducts[*].{Name:Name,Id:Id}"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: idp-mvp
+    Description: ProjectName used for the idp-environment-stack (used to build the service stack name to delete).
+
+Resources:
+
+  TeardownServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-app-teardown-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: teardown-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackEvents
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${EnvironmentName}-*/*
+              - Effect: Allow
+                Action:
+                  - servicecatalog:DescribeProvisionedProduct
+                  - servicecatalog:TerminateProvisionedProduct
+                  - servicecatalog:DescribeRecord
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Sub arn:aws:s3:::${EnvironmentName}-*-pipeline-artifacts-${AWS::AccountId}
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${EnvironmentName}-*-pipeline-artifacts-${AWS::AccountId}/*
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                  - ecr:BatchDeleteImage
+                  - ecr:DeleteRepository
+                Resource: '*'
+
+  TeardownProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${EnvironmentName}-app-teardown
+      Description: >-
+        On-demand teardown - deletes one app's service stack, Service
+        Catalog-provisioned pipeline, and ECR repo. Requires APP_NAME and
+        PROVISIONED_PRODUCT_ID overrides at build start.
+      ServiceRole: !GetAtt TeardownServiceRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - |
+                  set -e
+                  if [ -z "$APP_NAME" ] || [ -z "$PROVISIONED_PRODUCT_ID" ]; then
+                    echo "ERROR: this build must be started with APP_NAME and PROVISIONED_PRODUCT_ID environment variable overrides."
+                    exit 1
+                  fi
+
+                  echo "=== Tearing down app: $APP_NAME (provisioned product: $PROVISIONED_PRODUCT_ID) ==="
+                  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                  SERVICE_STACK="${ENVIRONMENT_NAME}-${APP_NAME}"
+
+                  echo "--- Step 1: service stack $SERVICE_STACK ---"
+                  if aws cloudformation describe-stacks --stack-name "$SERVICE_STACK" >/dev/null 2>&1; then
+                    aws cloudformation delete-stack --stack-name "$SERVICE_STACK"
+                    aws cloudformation wait stack-delete-complete --stack-name "$SERVICE_STACK"
+                    echo "Service stack deleted."
+                  else
+                    echo "No service stack $SERVICE_STACK found, skipping."
+                  fi
+
+                  echo "--- Step 2: emptying pipeline artifact bucket ---"
+                  BUCKET="${ENVIRONMENT_NAME}-${APP_NAME}-pipeline-artifacts-${ACCOUNT_ID}"
+                  aws s3 rm "s3://${BUCKET}" --recursive || echo "Bucket ${BUCKET} already empty or missing, continuing."
+
+                  echo "--- Step 3: terminating provisioned product ---"
+                  aws servicecatalog terminate-provisioned-product --provisioned-product-id "$PROVISIONED_PRODUCT_ID" || true
+
+                  FORCED_ECR_DELETE=false
+                  for i in $(seq 1 20); do
+                    STATUS=$(aws servicecatalog describe-provisioned-product --id "$PROVISIONED_PRODUCT_ID" --query 'ProvisionedProductDetail.Status' --output text 2>/dev/null || echo "GONE")
+                    echo "[$i] provisioned product status: $STATUS"
+                    if [ "$STATUS" == "GONE" ]; then
+                      echo "Provisioned product fully removed."
+                      break
+                    fi
+                    if [ "$STATUS" == "ERROR" ] && [ "$FORCED_ECR_DELETE" == "false" ]; then
+                      echo "Termination stuck, likely ECR repo $APP_NAME still has images - force-deleting it."
+                      aws ecr delete-repository --repository-name "$APP_NAME" --force || true
+                      FORCED_ECR_DELETE=true
+                      aws servicecatalog terminate-provisioned-product --provisioned-product-id "$PROVISIONED_PRODUCT_ID" || true
+                    fi
+                    sleep 15
+                  done
+
+                  echo "=== Teardown complete for $APP_NAME ==="
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: APP_NAME
+            Value: REQUIRED_OVERRIDE_AT_BUILD_START
+          - Name: PROVISIONED_PRODUCT_ID
+            Value: REQUIRED_OVERRIDE_AT_BUILD_START
+
+Outputs:
+  TeardownProjectName:
+    Value: !Ref TeardownProject
