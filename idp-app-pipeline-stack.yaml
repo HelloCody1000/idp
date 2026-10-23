@@ -9,11 +9,12 @@ Description: >
   idp-environment-stack.yaml and an authorized CodeStar GitHub
   connection to already exist.
 
-  Your app repo needs a Dockerfile at its root, plus: for Node,
-  package.json at the root; for Java, a pom.xml that builds
-  target/app.jar (set <finalName>app</finalName> in your pom.xml); for
-  Docker, nothing else - your Dockerfile must build the app itself
-  (e.g. a multi-stage build).
+  Your app needs a Dockerfile in AppSourcePath (default "." - the repo
+  root; set it to a subdirectory like apps/java-app for a monorepo),
+  plus: for Node, package.json alongside it; for Java, a pom.xml there
+  that builds target/app.jar (set <finalName>app</finalName> in your
+  pom.xml); for Docker, nothing else - your Dockerfile must build the
+  app itself (e.g. a multi-stage build).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -29,6 +30,7 @@ Metadata:
         Parameters:
           - RepositoryId
           - BranchName
+          - AppSourcePath
       - Label:
           default: Scaling
         Parameters:
@@ -57,6 +59,8 @@ Metadata:
         default: Git repo (owner/repo)
       BranchName:
         default: Branch to build from
+      AppSourcePath:
+        default: Subdirectory (monorepos only)
       MinCapacity:
         default: Minimum tasks
       MaxCapacity:
@@ -94,6 +98,14 @@ Parameters:
     Type: String
     Default: develop
     Description: Branch in your repo to build from.
+
+  AppSourcePath:
+    Type: String
+    Default: '.'
+    Description: >-
+      Subdirectory within the repo where this app's Dockerfile/package.json/pom.xml
+      live. Leave as "." if the whole repo is this one app. For a monorepo, use
+      the path relative to the repo root with no leading slash, e.g. apps/java-app.
 
   ContainerPort:
     Type: Number
@@ -369,6 +381,8 @@ Resources:
             Value: !Ref MinCapacity
           - Name: MAX_CAPACITY
             Value: !Ref MaxCapacity
+          - Name: APP_SOURCE_PATH
+            Value: !Ref AppSourcePath
       Source:
         Type: CODEPIPELINE
         BuildSpec: !If
@@ -383,11 +397,11 @@ Resources:
                 commands:
                   - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
                   - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-                  - npm install
+                  - npm install --prefix "$APP_SOURCE_PATH"
                   - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
               build:
                 commands:
-                  - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                  - docker build -t $SERVICE_NAME:$IMAGE_TAG "$APP_SOURCE_PATH"
                   - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
               post_build:
                 commands:
@@ -412,11 +426,11 @@ Resources:
                   commands:
                     - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
                     - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
-                    - mvn -B package
+                    - mvn -B -f "$APP_SOURCE_PATH/pom.xml" package
                     - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
                 build:
                   commands:
-                    - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                    - docker build -t $SERVICE_NAME:$IMAGE_TAG "$APP_SOURCE_PATH"
                     - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
                 post_build:
                   commands:
@@ -439,7 +453,7 @@ Resources:
                     - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:-latest}
                 build:
                   commands:
-                    - docker build -t $SERVICE_NAME:$IMAGE_TAG .
+                    - docker build -t $SERVICE_NAME:$IMAGE_TAG "$APP_SOURCE_PATH"
                     - docker tag $SERVICE_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$SERVICE_NAME:$IMAGE_TAG
                 post_build:
                   commands:
